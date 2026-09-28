@@ -1,12 +1,15 @@
 import AppKit
+import Carbon
 import ServiceManagement
 
-// Highlighter: hold Hyper (Caps Lock via Karabiner = ⌘⌃⌥⇧) and drag to draw on any screen.
-// Strokes fade on their own. Settings live in the menu bar item and persist in UserDefaults.
+// Highlighter: hold Hyper (Caps Lock via Karabiner = ⌘⌃⌥⇧) and drag to draw on any screen, strokes fade on their own.
+// Hyper+1 toggles draw mode: plain drag draws, strokes stay until a slide key (arrows, space, Page Up/Down)
+// or Hyper+1 again clears them. Settings live in the menu bar item and persist in UserDefaults.
 // Menu bar only (no Dock icon), registers itself as a login item on first launch.
-// No permissions needed: modifiers are polled, and a transparent overlay only takes the mouse while Hyper is held.
+// Modifiers are polled and Hyper+1 is a Carbon hotkey. Only the slide-key watcher needs Accessibility.
 
 let hyper: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
+let clearKeys: Set<UInt16> = [123, 124, 125, 126, 49, 116, 121] // ← → ↓ ↑ space PageUp PageDown
 let fadeDuration = 0.4
 let rainbowLength: CGFloat = 500 // stroke length (pt) for one full hue cycle
 
@@ -39,14 +42,18 @@ enum Settings {
     }
 }
 
-// One freehand stroke. Captures the settings at the moment it starts.
+// One freehand stroke. Captures the settings at the moment it starts. Draw mode strokes never fade.
 final class Stroke {
     var points: [CGPoint]
     let color = palette.first { $0.name == Settings.color }?.color
-    let width = Settings.width, opacity = Settings.opacity, hold = Settings.hold
+    let width = Settings.width, opacity = Settings.opacity
+    let hold: Double
     var done: Date?
 
-    init(at p: CGPoint) { points = [p] }
+    init(at p: CGPoint, sticky: Bool) {
+        points = [p]
+        hold = sticky ? .infinity : Settings.hold
+    }
 
     // Current alpha, or nil once fully faded.
     func alpha(at now: Date) -> Double? {
@@ -61,11 +68,12 @@ final class Stroke {
 final class OverlayView: NSView {
     var strokes: [Stroke] = []
     var current: Stroke?
+    var sticky = false
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with e: NSEvent) {
-        let s = Stroke(at: convert(e.locationInWindow, from: nil))
+        let s = Stroke(at: convert(e.locationInWindow, from: nil), sticky: sticky)
         strokes.append(s)
         current = s
         needsDisplay = true
@@ -83,9 +91,15 @@ final class OverlayView: NSView {
         current = nil
     }
 
-    // Called every frame: drops faded strokes and redraws while anything is visible.
+    func clear() {
+        strokes = []
+        current = nil
+        needsDisplay = true
+    }
+
+    // Called every frame: drops faded strokes and redraws while any stroke is fading.
     func tick(_ now: Date) {
-        guard !strokes.isEmpty else { return }
+        guard strokes.contains(where: { $0.hold.isFinite }) else { return }
         strokes.removeAll { $0.alpha(at: now) == nil }
         needsDisplay = true
     }
@@ -164,9 +178,17 @@ final class ActionItem: NSMenuItem {
     @objc func fire() { run() }
 }
 
+// Private CoreGraphics call that lets a background app set the cursor (we never take focus from the slides).
+@_silgen_name("_CGSDefaultConnection") func _CGSDefaultConnection() -> Int32
+@_silgen_name("CGSSetConnectionProperty")
+func CGSSetConnectionProperty(_ cid: Int32, _ target: Int32, _ key: CFString, _ value: CFTypeRef) -> Int32
+
 final class App: NSObject, NSApplicationDelegate {
     var overlays: [Overlay] = []
-    var drawing = false
+    var drawing = false // overlay takes the mouse: Hyper held or draw mode on
+    var sticky = false // draw mode, toggled by Hyper+1
+    var pen = NSCursor.arrow
+    var hotKey: EventHotKeyRef?
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -177,35 +199,78 @@ final class App: NSObject, NSApplicationDelegate {
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
         let timer = Timer(timeInterval: 1.0 / 60, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
         RunLoop.main.add(timer, forMode: .common) // .common keeps it running while the menu is open
+        let cid = _CGSDefaultConnection()
+        _ = CGSSetConnectionProperty(cid, cid, "SetsCursorInBackground" as CFString, kCFBooleanTrue)
+        registerHotKey()
+        watchSlideKeys()
     }
 
     @objc func buildOverlays() {
         overlays.forEach { $0.close() }
         overlays = NSScreen.screens.map { Overlay(screen: $0) }
         drawing = false
+        sticky = false
+    }
+
+    // Hyper+1 toggles draw mode. Turning it off clears everything.
+    func registerHotKey() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            (NSApp.delegate as? App)?.toggleSticky()
+            return noErr
+        }, 1, &spec, nil, nil)
+        RegisterEventHotKey(UInt32(kVK_ANSI_1), UInt32(cmdKey | controlKey | optionKey | shiftKey),
+                            EventHotKeyID(signature: 0x484C_4954, id: 1), GetApplicationEventTarget(), 0, &hotKey)
+    }
+
+    func toggleSticky() {
+        sticky.toggle()
+        for o in overlays {
+            o.view.sticky = sticky
+            if !sticky { o.view.clear() }
+        }
+    }
+
+    // Slide keys clear all strokes. Watching global keys needs Accessibility: asks once,
+    // then waits for the grant (signed with a stable certificate, so it survives rebuilds).
+    func watchSlideKeys() {
+        let trusted = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
+        let timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] t in
+            guard AXIsProcessTrusted() else { return }
+            t.invalidate()
+            NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { e in
+                if clearKeys.contains(e.keyCode) { self?.overlays.forEach { $0.view.clear() } }
+            }
+        }
+        if trusted { timer.fire() }
     }
 
     @objc func tick() {
-        let held = NSEvent.modifierFlags.isSuperset(of: hyper)
-        if held != drawing {
-            drawing = held
+        let active = sticky || NSEvent.modifierFlags.isSuperset(of: hyper)
+        if active != drawing {
+            drawing = active
             for o in overlays {
-                o.ignoresMouseEvents = !held
+                o.ignoresMouseEvents = !active
                 // macOS passes clicks through fully transparent pixels, so tint invisibly while drawing.
-                o.backgroundColor = held ? NSColor(white: 0, alpha: 0.001) : .clear
-                if !held { o.view.finishStroke() } // key released mid-drag
+                o.backgroundColor = active ? NSColor(white: 0, alpha: 0.001) : .clear
+                if !active { o.view.finishStroke() } // key released mid-drag
             }
+            if !active { NSCursor.arrow.set() }
         }
+        if drawing { pen.set() } // every frame, the app underneath may reset it
         let now = Date()
         overlays.forEach { $0.view.tick(now) }
     }
 
     func refreshMenu() {
         item.button?.image = dotImage(Settings.color)
+        pen = penCursor(Settings.color)
         let menu = NSMenu()
-        let hint = NSMenuItem(title: "Hold Caps Lock and drag to draw", action: nil, keyEquivalent: "")
-        hint.isEnabled = false
-        menu.addItem(hint)
+        for text in ["Hold Caps Lock and drag to draw", "Caps Lock+1: draw mode, slide keys clear"] {
+            let hint = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+            hint.isEnabled = false
+            menu.addItem(hint)
+        }
         menu.addItem(.separator())
         menu.addItem(group("Color", palette.map { p in (p.name, Settings.color == p.name, { Settings.color = p.name }) }, swatches: true))
         menu.addItem(group("Width", [3.0, 6, 12, 26].map { w in ("\(Int(w)) px", Settings.width == w, { Settings.width = w }) }))
@@ -239,12 +304,44 @@ final class App: NSObject, NSApplicationDelegate {
                 dot.lineWidth = 0.5
                 dot.stroke()
             } else {
-                NSGradient(colors: [.red, .orange, .yellow, .green, .cyan, .blue, .magenta])?.draw(in: dot, angle: 0)
+                rainbow.draw(in: dot, angle: 0)
             }
             return true
         }
     }
+
+    // SF pencil in the named palette color with a dark outline. Hotspot is the tip (bottom left).
+    func penCursor(_ name: String) -> NSCursor {
+        let symbol = NSImage(systemSymbolName: "pencil", accessibilityDescription: nil)!
+            .withSymbolConfiguration(.init(pointSize: 20, weight: .medium))!
+        let pad: CGFloat = 2
+        let glyph = NSRect(x: pad, y: pad, width: symbol.size.width, height: symbol.size.height)
+        let size = NSSize(width: glyph.width + 2 * pad, height: glyph.height + 2 * pad)
+        // The symbol drawn as a mask, filled with a color or the rainbow gradient.
+        func tinted(_ fill: @escaping (NSRect) -> Void) -> NSImage {
+            NSImage(size: size, flipped: false) { r in
+                symbol.draw(in: glyph)
+                NSGraphicsContext.current?.compositingOperation = .sourceAtop
+                fill(r)
+                return true
+            }
+        }
+        let outline = tinted { NSColor.black.setFill(); $0.fill(using: .sourceAtop) }
+        let body = tinted { r in
+            if let color = palette.first(where: { $0.name == name })?.color { color.setFill(); r.fill(using: .sourceAtop) }
+            else { rainbow.draw(in: r, angle: 45) }
+        }
+        let image = NSImage(size: size, flipped: false) { r in
+            for dx in [-1.2, 0, 1.2] { for dy in [-1.2, 0, 1.2] { outline.draw(in: r.offsetBy(dx: dx, dy: dy)) } }
+            body.draw(in: r)
+            return true
+        }
+        // The tip sits about 2 pt in and 2 pt up from the glyph's bottom-left corner (hotspot is top-left based).
+        return NSCursor(image: image, hotSpot: NSPoint(x: pad + 2, y: size.height - pad - 2))
+    }
 }
+
+let rainbow = NSGradient(colors: [.red, .orange, .yellow, .green, .cyan, .blue, .magenta])!
 
 let app = NSApplication.shared
 let delegate = App()

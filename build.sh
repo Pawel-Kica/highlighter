@@ -23,4 +23,6 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 xattr -cr "$APP" # Finder attributes make codesign fail
-codesign --force -s - "$APP"
+# Apple Development cert when available: a stable signature keeps the Accessibility grant across rebuilds (ad hoc loses it)
+ID=$(security find-identity -v -p codesigning | grep -m1 -o '"Apple Development[^"]*"' | tr -d '"' || true)
+codesign --force -s "${ID:--}" "$APP"
