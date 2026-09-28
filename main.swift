@@ -193,6 +193,8 @@ final class App: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         buildOverlays()
+        // Same pencil as the app icon, template so it follows the menu bar's light/dark look.
+        item.button?.image = NSImage(systemSymbolName: "pencil", accessibilityDescription: "Highlighter")
         refreshMenu()
         if SMAppService.mainApp.status == .notRegistered { try? SMAppService.mainApp.register() }
         NotificationCenter.default.addObserver(self, selector: #selector(buildOverlays),
@@ -263,7 +265,6 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     func refreshMenu() {
-        item.button?.image = dotImage(Settings.color)
         pen = penCursor(Settings.color)
         let menu = NSMenu()
         for text in ["Hold Caps Lock and drag to draw", "Caps Lock+1: draw mode, slide keys clear"] {
@@ -293,7 +294,7 @@ final class App: NSObject, NSApplicationDelegate {
         return parent
     }
 
-    // A dot in the named palette color: the menu bar icon and the Color swatches.
+    // A dot in the named palette color: the Color swatches.
     func dotImage(_ name: String) -> NSImage {
         NSImage(size: NSSize(width: 18, height: 18), flipped: false) { r in
             let dot = NSBezierPath(ovalIn: r.insetBy(dx: 3, dy: 3))
