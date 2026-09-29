@@ -1,9 +1,14 @@
 #!/bin/sh
 # Builds and installs /Applications/Highlighter.app (Spotlight and Raycast find it there).
 # A running copy keeps the old build until relaunched: pkill -x Highlighter; open /Applications/Highlighter.app
+# APP=/some/path/Highlighter.app ./build.sh builds somewhere else.
+# SIGN_IDENTITY="Apple Development: ..." ./build.sh signs with a real certificate (see `security find-identity -v -p codesigning`).
+# Or put that name in a gitignored .sign-identity file next to this script, so every build uses it.
+# Ad hoc by default, which works but changes every build, so macOS asks for Accessibility again after a rebuild.
 set -e
 cd "$(dirname "$0")"
-APP=/Applications/Highlighter.app
+APP=${APP:-/Applications/Highlighter.app}
+[ -z "$SIGN_IDENTITY" ] && [ -f .sign-identity ] && SIGN_IDENTITY=$(cat .sign-identity)
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp AppIcon.icns "$APP/Contents/Resources/" # from make-icon.swift
 swiftc -O main.swift -o /tmp/Highlighter.new
@@ -23,6 +28,4 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 xattr -cr "$APP" # Finder attributes make codesign fail
-# Apple Development cert when available: a stable signature keeps the Accessibility grant across rebuilds (ad hoc loses it)
-ID=$(security find-identity -v -p codesigning | grep -m1 -o '"Apple Development[^"]*"' | tr -d '"' || true)
-codesign --force -s "${ID:--}" "$APP"
+codesign --force -s "${SIGN_IDENTITY:--}" "$APP"
