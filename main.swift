@@ -3,7 +3,8 @@ import Carbon
 import ServiceManagement
 
 // Highlighter: Hyper+1 (Caps Lock via Karabiner = ⌘⌃⌥⇧) toggles draw mode, then plain drag draws on any screen.
-// Strokes stay until right-click, a slide key (arrows, space, Page Up/Down) or Hyper+1 again clears them.
+// Strokes stay until a slide key (arrows, space, Page Up/Down) clears them. Right-click or Hyper+1 again
+// turns draw mode off and clears.
 // Settings live in the menu bar item and persist in UserDefaults.
 // Menu bar only (no Dock icon), registers itself as a login item on first launch.
 // Hyper+1 is a Carbon hotkey. Only the slide-key watcher needs Accessibility.
@@ -68,8 +69,8 @@ final class OverlayView: NSView {
 
     override func mouseUp(with e: NSEvent) { current = nil }
 
-    // Right-click clears every screen, draw mode stays on.
-    override func rightMouseDown(with e: NSEvent) { (NSApp.delegate as? App)?.clearAll() }
+    // Right-click turns draw mode off, which clears every screen. Only reachable while draw mode is on.
+    override func rightMouseDown(with e: NSEvent) { (NSApp.delegate as? App)?.toggleDrawMode() }
 
     func clear() {
         strokes = []
@@ -232,7 +233,7 @@ final class App: NSObject, NSApplicationDelegate {
     func refreshMenu() {
         pen = penCursor(Settings.color)
         let menu = NSMenu()
-        for text in ["Caps Lock+1: draw mode", "Right-click or slide keys clear"] {
+        for text in ["Caps Lock+1: draw mode, slide keys clear", "Right-click: stop drawing and clear"] {
             let hint = NSMenuItem(title: text, action: nil, keyEquivalent: "")
             hint.isEnabled = false
             menu.addItem(hint)
