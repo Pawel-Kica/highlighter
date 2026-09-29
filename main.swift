@@ -167,7 +167,7 @@ final class App: NSObject, NSApplicationDelegate {
         buildOverlays()
         // Filled circle with a pen tip, sized to match other menu bar icons. Template, so it follows light/dark.
         item.button?.image = NSImage(systemSymbolName: "pencil.tip.crop.circle.fill", accessibilityDescription: "Highlighter")?
-            .withSymbolConfiguration(.init(pointSize: 15, weight: .semibold))
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .semibold))
         refreshMenu()
         if SMAppService.mainApp.status == .notRegistered { try? SMAppService.mainApp.register() }
         NotificationCenter.default.addObserver(self, selector: #selector(buildOverlays),
