@@ -2,15 +2,13 @@ import AppKit
 import Carbon
 import ServiceManagement
 
-// Highlighter: hold Hyper (Caps Lock via Karabiner = ⌘⌃⌥⇧) and drag to draw on any screen, strokes fade on their own.
-// Hyper+1 toggles draw mode: plain drag draws, strokes stay until a slide key (arrows, space, Page Up/Down)
-// or Hyper+1 again clears them. Settings live in the menu bar item and persist in UserDefaults.
+// Highlighter: Hyper+1 (Caps Lock via Karabiner = ⌘⌃⌥⇧) toggles draw mode, then plain drag draws on any screen.
+// Strokes stay until right-click, a slide key (arrows, space, Page Up/Down) or Hyper+1 again clears them.
+// Settings live in the menu bar item and persist in UserDefaults.
 // Menu bar only (no Dock icon), registers itself as a login item on first launch.
-// Modifiers are polled and Hyper+1 is a Carbon hotkey. Only the slide-key watcher needs Accessibility.
+// Hyper+1 is a Carbon hotkey. Only the slide-key watcher needs Accessibility.
 
-let hyper: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
 let clearKeys: Set<UInt16> = [123, 124, 125, 126, 49, 116, 121] // ← → ↓ ↑ space PageUp PageDown
-let fadeDuration = 0.4
 let rainbowLength: CGFloat = 500 // stroke length (pt) for one full hue cycle
 
 // nil color = rainbow
@@ -35,45 +33,29 @@ enum Settings {
     }
     static var width: Double { get { value("width", 6) } set { UserDefaults.standard.set(newValue, forKey: "width") } }
     static var opacity: Double { get { value("opacity", 1) } set { UserDefaults.standard.set(newValue, forKey: "opacity") } }
-    static var hold: Double { get { value("hold", 1) } set { UserDefaults.standard.set(newValue, forKey: "hold") } }
 
     private static func value(_ key: String, _ fallback: Double) -> Double {
         UserDefaults.standard.object(forKey: key) as? Double ?? fallback
     }
 }
 
-// One freehand stroke. Captures the settings at the moment it starts. Draw mode strokes never fade.
+// One freehand stroke. Captures the settings at the moment it starts.
 final class Stroke {
     var points: [CGPoint]
     let color = palette.first { $0.name == Settings.color }?.color
     let width = Settings.width, opacity = Settings.opacity
-    let hold: Double
-    var done: Date?
 
-    init(at p: CGPoint, sticky: Bool) {
-        points = [p]
-        hold = sticky ? .infinity : Settings.hold
-    }
-
-    // Current alpha, or nil once fully faded.
-    func alpha(at now: Date) -> Double? {
-        guard let done else { return opacity }
-        let age = now.timeIntervalSince(done)
-        if age < hold { return opacity }
-        let t = (age - hold) / fadeDuration
-        return t >= 1 ? nil : opacity * (1 - t)
-    }
+    init(at p: CGPoint) { points = [p] }
 }
 
 final class OverlayView: NSView {
     var strokes: [Stroke] = []
     var current: Stroke?
-    var sticky = false
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func mouseDown(with e: NSEvent) {
-        let s = Stroke(at: convert(e.locationInWindow, from: nil), sticky: sticky)
+        let s = Stroke(at: convert(e.locationInWindow, from: nil))
         strokes.append(s)
         current = s
         needsDisplay = true
@@ -84,12 +66,10 @@ final class OverlayView: NSView {
         needsDisplay = true
     }
 
-    override func mouseUp(with e: NSEvent) { finishStroke() }
+    override func mouseUp(with e: NSEvent) { current = nil }
 
-    func finishStroke() {
-        current?.done = Date()
-        current = nil
-    }
+    // Right-click clears every screen, draw mode stays on.
+    override func rightMouseDown(with e: NSEvent) { (NSApp.delegate as? App)?.clearAll() }
 
     func clear() {
         strokes = []
@@ -97,20 +77,11 @@ final class OverlayView: NSView {
         needsDisplay = true
     }
 
-    // Called every frame: drops faded strokes and redraws while any stroke is fading.
-    func tick(_ now: Date) {
-        guard strokes.contains(where: { $0.hold.isFinite }) else { return }
-        strokes.removeAll { $0.alpha(at: now) == nil }
-        needsDisplay = true
-    }
-
     override func draw(_ dirtyRect: NSRect) {
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
-        let now = Date()
         for s in strokes {
-            guard let alpha = s.alpha(at: now) else { continue }
             ctx.saveGState()
-            ctx.setAlpha(alpha)
+            ctx.setAlpha(s.opacity)
             // Transparency layer so overlapping parts of one stroke don't stack up.
             ctx.beginTransparencyLayer(auxiliaryInfo: nil)
             ctx.setLineWidth(s.width)
@@ -185,8 +156,7 @@ func CGSSetConnectionProperty(_ cid: Int32, _ target: Int32, _ key: CFString, _ 
 
 final class App: NSObject, NSApplicationDelegate {
     var overlays: [Overlay] = []
-    var drawing = false // overlay takes the mouse: Hyper held or draw mode on
-    var sticky = false // draw mode, toggled by Hyper+1
+    var drawMode = false // toggled by Hyper+1, overlay takes the mouse
     var pen = NSCursor.arrow
     var hotKey: EventHotKeyRef?
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -210,28 +180,35 @@ final class App: NSObject, NSApplicationDelegate {
     @objc func buildOverlays() {
         overlays.forEach { $0.close() }
         overlays = NSScreen.screens.map { Overlay(screen: $0) }
-        drawing = false
-        sticky = false
+        drawMode = false
     }
 
-    // Hyper+1 toggles draw mode. Turning it off clears everything.
+    // Hyper+1 toggles draw mode.
     func registerHotKey() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            (NSApp.delegate as? App)?.toggleSticky()
+            (NSApp.delegate as? App)?.toggleDrawMode()
             return noErr
         }, 1, &spec, nil, nil)
         RegisterEventHotKey(UInt32(kVK_ANSI_1), UInt32(cmdKey | controlKey | optionKey | shiftKey),
                             EventHotKeyID(signature: 0x484C_4954, id: 1), GetApplicationEventTarget(), 0, &hotKey)
     }
 
-    func toggleSticky() {
-        sticky.toggle()
+    // On: overlays take the mouse. Off: clicks go through again and everything is cleared.
+    func toggleDrawMode() {
+        drawMode.toggle()
         for o in overlays {
-            o.view.sticky = sticky
-            if !sticky { o.view.clear() }
+            o.ignoresMouseEvents = !drawMode
+            // macOS passes clicks through fully transparent pixels, so tint invisibly while drawing.
+            o.backgroundColor = drawMode ? NSColor(white: 0, alpha: 0.001) : .clear
+        }
+        if !drawMode {
+            clearAll()
+            NSCursor.arrow.set()
         }
     }
+
+    func clearAll() { overlays.forEach { $0.view.clear() } }
 
     // Slide keys clear all strokes. Watching global keys needs Accessibility: asks once,
     // then waits for the grant (signed with a stable certificate, so it survives rebuilds).
@@ -241,33 +218,21 @@ final class App: NSObject, NSApplicationDelegate {
             guard AXIsProcessTrusted() else { return }
             t.invalidate()
             NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { e in
-                if clearKeys.contains(e.keyCode) { self?.overlays.forEach { $0.view.clear() } }
+                if clearKeys.contains(e.keyCode) { self?.clearAll() }
             }
         }
         if trusted { timer.fire() }
     }
 
+    // Every frame in draw mode, the app underneath may reset the cursor.
     @objc func tick() {
-        let active = sticky || NSEvent.modifierFlags.isSuperset(of: hyper)
-        if active != drawing {
-            drawing = active
-            for o in overlays {
-                o.ignoresMouseEvents = !active
-                // macOS passes clicks through fully transparent pixels, so tint invisibly while drawing.
-                o.backgroundColor = active ? NSColor(white: 0, alpha: 0.001) : .clear
-                if !active { o.view.finishStroke() } // key released mid-drag
-            }
-            if !active { NSCursor.arrow.set() }
-        }
-        if drawing { pen.set() } // every frame, the app underneath may reset it
-        let now = Date()
-        overlays.forEach { $0.view.tick(now) }
+        if drawMode { pen.set() }
     }
 
     func refreshMenu() {
         pen = penCursor(Settings.color)
         let menu = NSMenu()
-        for text in ["Hold Caps Lock and drag to draw", "Caps Lock+1: draw mode, slide keys clear"] {
+        for text in ["Caps Lock+1: draw mode", "Right-click or slide keys clear"] {
             let hint = NSMenuItem(title: text, action: nil, keyEquivalent: "")
             hint.isEnabled = false
             menu.addItem(hint)
@@ -276,7 +241,6 @@ final class App: NSObject, NSApplicationDelegate {
         menu.addItem(group("Color", palette.map { p in (p.name, Settings.color == p.name, { Settings.color = p.name }) }, swatches: true))
         menu.addItem(group("Width", [3.0, 6, 12, 26].map { w in ("\(Int(w)) px", Settings.width == w, { Settings.width = w }) }))
         menu.addItem(group("Opacity", [0.5, 0.85, 1].map { o in ("\(Int(o * 100))%", Settings.opacity == o, { Settings.opacity = o }) }))
-        menu.addItem(group("Fade after", [0.5, 1, 1.5, 3].map { h in ("\(h.formatted()) s", Settings.hold == h, { Settings.hold = h }) }))
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu
