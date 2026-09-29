@@ -3,13 +3,14 @@ import Carbon
 import ServiceManagement
 
 // Highlighter: Hyper+1 (Caps Lock via Karabiner = ⌘⌃⌥⇧) toggles draw mode, then plain drag draws on any screen.
-// Strokes stay until a slide key (arrows, space, Page Up/Down) clears them. Right-click or Hyper+1 again
-// turns draw mode off and clears.
+// Strokes stay until a slide key (arrows, space, Page Up/Down) clears them. Right-click, 4 (with or without
+// Hyper) or Hyper+1 again turns draw mode off and clears.
 // Settings live in the menu bar item and persist in UserDefaults.
 // Menu bar only (no Dock icon), registers itself as a login item on first launch.
 // Hyper+1 is a Carbon hotkey. Only the slide-key watcher needs Accessibility.
 
 let clearKeys: Set<UInt16> = [123, 124, 125, 126, 49, 116, 121] // ← → ↓ ↑ space PageUp PageDown
+let stopKey: UInt16 = 21 // 4, any modifiers
 let rainbowLength: CGFloat = 500 // stroke length (pt) for one full hue cycle
 
 // nil color = rainbow
@@ -211,7 +212,7 @@ final class App: NSObject, NSApplicationDelegate {
 
     func clearAll() { overlays.forEach { $0.view.clear() } }
 
-    // Slide keys clear all strokes. Watching global keys needs Accessibility: asks once,
+    // Slide keys clear all strokes, 4 turns draw mode off. Watching global keys needs Accessibility: asks once,
     // then waits for the grant (signed with a stable certificate, so it survives rebuilds).
     func watchSlideKeys() {
         let trusted = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary)
@@ -220,6 +221,7 @@ final class App: NSObject, NSApplicationDelegate {
             t.invalidate()
             NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { e in
                 if clearKeys.contains(e.keyCode) { self?.clearAll() }
+                if e.keyCode == stopKey, self?.drawMode == true { self?.toggleDrawMode() }
             }
         }
         if trusted { timer.fire() }
@@ -233,7 +235,7 @@ final class App: NSObject, NSApplicationDelegate {
     func refreshMenu() {
         pen = penCursor(Settings.color)
         let menu = NSMenu()
-        for text in ["Caps Lock+1: draw mode, slide keys clear", "Right-click: stop drawing and clear"] {
+        for text in ["Caps Lock+1: draw mode, slide keys clear", "Right-click or 4: stop drawing and clear"] {
             let hint = NSMenuItem(title: text, action: nil, keyEquivalent: "")
             hint.isEnabled = false
             menu.addItem(hint)
