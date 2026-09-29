@@ -165,8 +165,9 @@ final class App: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         buildOverlays()
-        // Same pencil as the app icon, template so it follows the menu bar's light/dark look.
-        item.button?.image = NSImage(systemSymbolName: "pencil", accessibilityDescription: "Highlighter")
+        // Filled circle with a pen tip, sized to match other menu bar icons. Template, so it follows light/dark.
+        item.button?.image = NSImage(systemSymbolName: "pencil.tip.crop.circle.fill", accessibilityDescription: "Highlighter")?
+            .withSymbolConfiguration(.init(pointSize: 15, weight: .semibold))
         refreshMenu()
         if SMAppService.mainApp.status == .notRegistered { try? SMAppService.mainApp.register() }
         NotificationCenter.default.addObserver(self, selector: #selector(buildOverlays),
