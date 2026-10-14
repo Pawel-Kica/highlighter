@@ -5,12 +5,14 @@ import ServiceManagement
 // Highlighter: Hyper+1 (Caps Lock via Karabiner = ⌘⌃⌥⇧) toggles draw mode, then plain drag draws on any screen.
 // Strokes stay until C or a slide key (arrows, space, Page Up/Down) clears them. X, Esc or Hyper+1 again
 // turns draw mode off and clears. S copies a screenshot of the screen under the cursor, then does the same.
-// A switches between the pen and the arrow tool (drag from tail to tip). Right-click runs one of these.
+// A switches between the pen and the arrow tool (drag from tail to tip). Q types a label at the start of each
+// stroke in turn, Return moves to the next one, Esc or a click ends. Right-click runs one of these.
+// A screenshot app's area selection (CleanShot's ⌘⇧3) turns draw mode off and clears once released.
 // Settings, shortcuts and the right-click action live in the menu bar item and persist in UserDefaults.
 // Menu bar only (no Dock icon), registers itself as a login item on first launch.
 // The shortcuts are Carbon hotkeys, so the app underneath never sees them. All but Draw mode are only
 // registered while drawing.
-// The slide-key watcher needs Accessibility, the screenshot needs Screen Recording.
+// The slide-key watcher and the label typing need Accessibility, the screenshot needs Screen Recording.
 
 // A key plus Carbon modifiers, with the text the menu shows for it.
 struct Shortcut: Codable { var code: Int; var mods: Int; var label: String }
@@ -20,6 +22,7 @@ let actions: [(id: UInt32, name: String, key: Shortcut)] = [
     (1, "Draw mode", Shortcut(code: kVK_ANSI_1, mods: cmdKey | controlKey | optionKey | shiftKey, label: "Caps Lock+1")),
     (2, "Clear", Shortcut(code: kVK_ANSI_C, mods: 0, label: "C")),
     (5, "Switch pen/arrow", Shortcut(code: kVK_ANSI_A, mods: 0, label: "A")),
+    (6, "Label", Shortcut(code: kVK_ANSI_Q, mods: 0, label: "Q")),
     (4, "Screenshot", Shortcut(code: kVK_ANSI_S, mods: 0, label: "S")),
     (3, "Stop drawing", Shortcut(code: kVK_ANSI_X, mods: 0, label: "X")),
 ]
@@ -86,11 +89,20 @@ final class Stroke {
     let arrow: Bool
     let color: NSColor? // nil = rainbow
     let width = Settings.width, opacity = Settings.opacity
+    var label = "" // typed after Q, drawn at the first point
 
     init(at p: CGPoint, arrow: Bool, color: String) {
         points = [p]
         self.arrow = arrow
         self.color = palette.first { $0.name == color }?.color
+    }
+
+    // Unit vector from the middle of the stroke's bounds to its first point. The label sits past the first point in
+    // that direction: behind an arrow's tail, outside a circle. nil for a dot, which can't get a label.
+    var outward: CGPoint? {
+        let xs = points.map(\.x), ys = points.map(\.y), a = points[0]
+        let dx = a.x - (xs.min()! + xs.max()!) / 2, dy = a.y - (ys.min()! + ys.max()!) / 2, len = hypot(dx, dy)
+        return len > 1 ? CGPoint(x: dx / len, y: dy / len) : nil
     }
 }
 
@@ -102,6 +114,8 @@ final class OverlayView: NSView {
 
     override func mouseDown(with e: NSEvent) {
         guard let app = NSApp.delegate as? App else { return }
+        app.pressDrew = true
+        app.endLabel()
         let s = Stroke(at: convert(e.locationInWindow, from: nil), arrow: app.arrowTool, color: app.nextColor)
         strokes.append(s)
         current = s
@@ -166,6 +180,38 @@ final class OverlayView: NSView {
             ctx.endTransparencyLayer()
             ctx.restoreGState()
         }
+        let app = NSApp.delegate as? App
+        for s in strokes { drawLabel(s, app?.labeling?.stroke === s ? app : nil) }
+    }
+
+    // Pill in the stroke's color just past its first point (see Stroke.outward), kept on screen. Text size follows the
+    // stroke width. The stroke being labeled (app set) also gets a blinking caret and, right after the jump to it, a
+    // fading ring on its first point.
+    func drawLabel(_ s: Stroke, _ app: App?) {
+        guard !s.label.isEmpty || app != nil, let d = s.outward else { return }
+        let font = NSFont.systemFont(ofSize: 14 + s.width * 1.5, weight: .semibold)
+        let rgb = s.color?.usingColorSpace(.sRGB)
+        let light = rgb.map { 0.2126 * $0.redComponent + 0.7152 * $0.greenComponent + 0.0722 * $0.blueComponent > 0.59 } ?? true
+        let ink: NSColor = light ? .black : .white
+        let text = NSAttributedString(string: s.label, attributes: [.font: font, .foregroundColor: ink])
+        let padX: CGFloat = 10, padY: CGFloat = 6, textW = text.size().width, lineH = ceil(font.ascender - font.descender)
+        let w = textW + padX * 2 + (app != nil ? 3 : 0), h = lineH + padY * 2
+        // The box edge nearest the first point faces it: d = (1, 0) puts the box right of it, (1, 1) above right.
+        let a = s.points[0], m = max(abs(d.x), abs(d.y)), gap = 6 + s.width * 0.5
+        let cx = a.x + d.x * gap + d.x / m * w / 2, cy = a.y + d.y * gap + d.y / m * h / 2
+        let box = NSRect(x: min(max(cx - w / 2, 4), bounds.width - w - 4), y: min(max(cy - h / 2, 4), bounds.height - h - 4),
+                         width: w, height: h)
+        let t = CGFloat(Date().timeIntervalSince(app?.labelAt ?? .distantPast) / 0.4)
+        if t < 1 {
+            let ring = NSBezierPath(ovalIn: NSRect(x: a.x, y: a.y, width: 0, height: 0).insetBy(dx: -8 - 30 * t, dy: -8 - 30 * t))
+            ring.lineWidth = 3
+            (s.color ?? .white).withAlphaComponent(1 - t).setStroke()
+            ring.stroke()
+        }
+        let pill = NSBezierPath(roundedRect: box, xRadius: 8, yRadius: 8)
+        if let color = s.color { color.setFill(); pill.fill() } else { rainbow.draw(in: pill, angle: 0) }
+        text.draw(at: NSPoint(x: box.minX + padX, y: box.minY + padY))
+        if app?.caretOn == true { ink.setFill(); NSRect(x: box.minX + padX + textW + 1, y: box.minY + padY, width: 2, height: lineH).fill() }
     }
 
     // Tapered arrow as one filled shape: thin at the tail, growing into the head. Size follows the stroke width.
@@ -242,8 +288,14 @@ final class App: NSObject, NSApplicationDelegate {
     var arrowTool = false // A switches pen and arrow, draw mode starts with Settings.arrowTool
     var arrowCount = 0 // arrows drawn since the last clear, picks the next arrow color
     var cursor = NSCursor.arrow // pen or arrow glyph in the color of the next stroke
+    var pressed = false // left button was down last frame, see tick
+    var pressDrew = false // the overlays got the current left press, so it's a stroke, not a screenshot selection
+    var shotWait: (clipboard: Int, until: Date)? // a screenshot selection was released, draw mode ends soon, see tick
     var hotKey: EventHotKeyRef? // Draw mode
     var drawHotKeys: [EventHotKeyRef?] = [] // the other shortcuts, registered only in draw mode
+    var labeling: (view: OverlayView, stroke: Stroke)? // the stroke whose label is being typed, see startLabel
+    var labelAt = Date(), typedAt = Date(), caretOn = true // jump to the stroke, last key, caret blink
+    var keyTap: CFMachPort? // takes the keyboard while labeling
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
 
     func applicationDidFinishLaunching(_ n: Notification) {
@@ -301,23 +353,31 @@ final class App: NSObject, NSApplicationDelegate {
         if drawMode {
             arrowTool = Settings.arrowTool
             updateCursor()
-            for a in actions.dropFirst() {
-                let k = Settings.shortcut(a.name)
-                var ref: EventHotKeyRef?
-                RegisterEventHotKey(UInt32(k.code), UInt32(k.mods), EventHotKeyID(signature: 0x484C_4954, id: a.id),
-                                    GetApplicationEventTarget(), 0, &ref)
-                drawHotKeys.append(ref)
-            }
+            registerDrawKeys(true)
         } else {
-            drawHotKeys.forEach { UnregisterEventHotKey($0) }
-            drawHotKeys = []
             clearAll()
+            registerDrawKeys(false)
             NSCursor.arrow.set()
+        }
+    }
+
+    // Every shortcut but Draw mode, on in draw mode and off while typing a label.
+    func registerDrawKeys(_ on: Bool) {
+        drawHotKeys.forEach { UnregisterEventHotKey($0) }
+        drawHotKeys = []
+        guard on else { return }
+        for a in actions.dropFirst() {
+            let k = Settings.shortcut(a.name)
+            var ref: EventHotKeyRef?
+            RegisterEventHotKey(UInt32(k.code), UInt32(k.mods), EventHotKeyID(signature: 0x484C_4954, id: a.id),
+                                GetApplicationEventTarget(), 0, &ref)
+            drawHotKeys.append(ref)
         }
     }
 
     // Also starts the arrow colors over.
     func clearAll() {
+        endLabel()
         overlays.forEach { $0.view.clear() }
         if arrowCount != 0 {
             arrowCount = 0
@@ -330,6 +390,7 @@ final class App: NSObject, NSApplicationDelegate {
         switch action {
         case "Clear": clearAll()
         case "Switch pen/arrow": toggleTool()
+        case "Label": startLabel()
         case "Screenshot": screenshot()
         default: toggleDrawMode() // Draw mode, Stop drawing
         }
@@ -388,6 +449,84 @@ final class App: NSObject, NSApplicationDelegate {
 
     func updateCursor() { cursor = toolCursor(arrowTool ? "arrow.up.right" : "pencil", nextColor) }
 
+    // Strokes that can get a label (not dots), screen by screen in drawing order.
+    var labelable: [(view: OverlayView, stroke: Stroke)] {
+        overlays.flatMap { o in o.view.strokes.filter { $0.outward != nil }.map { (o.view, $0) } }
+    }
+
+    // Q: caret on the first stroke without a label, or the first stroke if all have one. Keys type into it until
+    // endLabel. They go through an event tap that keeps them from the app underneath (needs Accessibility), and
+    // the letter shortcuts are off meanwhile, so Hyper+1 is the only one that still works.
+    func startLabel() {
+        let all = labelable
+        guard labeling == nil, let first = all.first(where: { $0.stroke.label.isEmpty }) ?? all.first else { return }
+        if keyTap == nil {
+            keyTap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap, options: .defaultTap,
+                                       eventsOfInterest: CGEventMask(1 << CGEventType.keyDown.rawValue),
+                                       callback: { _, type, e, _ in
+                guard let app = NSApp.delegate as? App else { return Unmanaged.passUnretained(e) }
+                // macOS turns a slow or interrupted tap off, turn it back on if still labeling.
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    if let tap = app.keyTap, app.labeling != nil { CGEvent.tapEnable(tap: tap, enable: true) }
+                    return Unmanaged.passUnretained(e)
+                }
+                return app.labelKey(e) ? nil : Unmanaged.passUnretained(e)
+            }, userInfo: nil)
+            guard let tap = keyTap else { NSSound.beep(); return }
+            CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, tap, 0), .commonModes)
+        }
+        CGEvent.tapEnable(tap: keyTap!, enable: true)
+        registerDrawKeys(false)
+        focusLabel(first)
+    }
+
+    func focusLabel(_ l: (view: OverlayView, stroke: Stroke)) {
+        labeling?.view.needsDisplay = true
+        labeling = l
+        labelAt = Date()
+        typedAt = labelAt
+        l.view.needsDisplay = true
+    }
+
+    // Return: the next stroke, after the last one labeling ends.
+    func nextLabel() {
+        guard let l = labeling else { return }
+        l.stroke.label = l.stroke.label.trimmingCharacters(in: .whitespaces)
+        let all = labelable
+        if let i = all.firstIndex(where: { $0.stroke === l.stroke }), i + 1 < all.count { focusLabel(all[i + 1]) } else { endLabel() }
+    }
+
+    // Esc, a click, the last Return, a clear or draw mode off. The labels stay.
+    func endLabel() {
+        guard let l = labeling else { return }
+        l.stroke.label = l.stroke.label.trimmingCharacters(in: .whitespaces)
+        labeling = nil
+        l.view.needsDisplay = true
+        if let keyTap { CGEvent.tapEnable(tap: keyTap, enable: false) }
+        registerDrawKeys(true)
+    }
+
+    // A key press while labeling, true = swallow it. Keys with ⌘ or ⌃ pass, other keys without text are dropped.
+    func labelKey(_ e: CGEvent) -> Bool {
+        guard let l = labeling else { return false }
+        if !e.flags.intersection([.maskCommand, .maskControl]).isEmpty { return false }
+        switch e.getIntegerValueField(.keyboardEventKeycode) {
+        case 36, 76: nextLabel() // Return, keypad Enter
+        case Int64(stopKey): endLabel()
+        case 51: if !l.stroke.label.isEmpty { l.stroke.label.removeLast() } // Delete
+        default:
+            // Function keys (arrows, F1...) come as private-use characters.
+            let text = NSEvent(cgEvent: e)?.characters ?? ""
+            if text.unicodeScalars.allSatisfy({ $0.value >= 32 && $0.value != 127 && !(0xF700...0xF8FF).contains($0.value) }) {
+                l.stroke.label += text
+            }
+        }
+        typedAt = Date()
+        caretOn = true
+        l.view.needsDisplay = true
+        return true
+    }
+
     // Copies the screen under the cursor, drawings included, to the clipboard, then turns draw mode off.
     // Needs Screen Recording, macOS asks on first use.
     func screenshot() {
@@ -413,6 +552,7 @@ final class App: NSObject, NSApplicationDelegate {
             guard AXIsProcessTrusted() else { return }
             t.invalidate()
             NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { e in
+                guard self?.labeling == nil else { return }
                 if clearKeys.contains(e.keyCode) { self?.clearAll() }
                 if e.keyCode == stopKey, self?.drawMode == true { self?.toggleDrawMode() }
             }
@@ -421,8 +561,23 @@ final class App: NSObject, NSApplicationDelegate {
     }
 
     // Every frame in draw mode, the app underneath may reset the cursor.
+    // The overlays cover every screen, so a left press they never got went to something above them: a screenshot
+    // app's selection, like CleanShot's ⌘⇧3. A global event monitor never sees CleanShot's clicks, only the button
+    // state does. During that press the tool cursor stays away, after it the normal one shows. Draw mode turns off
+    // like S once the capture lands on the clipboard (CleanShot copies it about 0.1 s after the release), at the
+    // latest after 0.5 s, so the drawings are still in the capture.
     @objc func tick() {
-        if drawMode { cursor.set() }
+        guard drawMode else { pressed = false; shotWait = nil; return }
+        if let l = labeling {
+            let on = Date().timeIntervalSince(typedAt).truncatingRemainder(dividingBy: 1) < 0.55
+            if on != caretOn || Date() < labelAt + 0.4 { caretOn = on; l.view.needsDisplay = true }
+        }
+        let down = CGEventSource.buttonState(.hidSystemState, button: .left)
+        if pressed, !down, !pressDrew { shotWait = (NSPasteboard.general.changeCount, Date() + 0.5) }
+        if shotWait != nil { NSCursor.arrow.set() } else if !down || pressDrew { cursor.set() }
+        if !down { pressDrew = false }
+        pressed = down
+        if let w = shotWait, NSPasteboard.general.changeCount != w.clipboard || Date() > w.until { toggleDrawMode() }
     }
 
     func refreshMenu() {
